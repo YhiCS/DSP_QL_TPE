@@ -32,12 +32,14 @@ sides share the same representation before path_similarity is applied.
 
 import os
 import random
+import warnings
 from collections import Counter
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import networkx as nx
 import optuna
+from optuna.importance import get_param_importances, PedAnovaImportanceEvaluator
 from multiprocessing import get_context, cpu_count
 
 import dspMapBuilder
@@ -252,6 +254,30 @@ def _make_objective(dspTrial_pairs, fixed_seed,
 
     return objective, route_store
     
+# ---------------------------------------------------------------------------
+# Parameter importance helper
+# ---------------------------------------------------------------------------
+# PedAnova normalises in-scope importances to sum=1; do NOT mix Stage 1 and
+# Stage 2 importance values arithmetically (their in-scope subsets differ).
+def _param_importance(study, *, target):
+    """Return {param_name: importance} for every PARAM_SPACE key.
+    Keys outside the study's search space (or on any failure) are NaN.
+    PedAnova assumes minimization, so callers must negate the metric.
+    """
+    nan_dict = {k: float("nan") for k in PARAM_SPACE}
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            imp = get_param_importances(
+                study,
+                evaluator=PedAnovaImportanceEvaluator(target_quantile=0.1),
+                target=target,
+            )
+    except (ValueError, RuntimeError):
+        return nan_dict
+    return {k: float(imp.get(k, float("nan"))) for k in PARAM_SPACE}
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 runner  (shared-param TPE study across all pairs)
 # ---------------------------------------------------------------------------
@@ -481,6 +507,23 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
     if s1_study is not None:
         s1_pair_best = _s1_best_per_pair(s1_study, s1_route_store, dspTrial_pairs)
 
+    # ── Stage 1 parameter importance ─────────────────────────────────────────
+    # Group: importance against the mean-similarity objective (one dict, reused).
+    # Per-pair: importance against this pair's user_attr similarity (cached for
+    # reuse by both the S1_pair row and any S2_pair fallback row).
+    nan_imp = {k: float("nan") for k in PARAM_SPACE}
+    s1_group_imp = (
+        _param_importance(s1_study, target=lambda t: -(t.value or 0.0))
+        if s1_study is not None else dict(nan_imp)
+    )
+    s1_pair_imp = {}
+    if s1_study is not None:
+        for pid, _ in dspTrial_pairs:
+            s1_pair_imp[pid] = _param_importance(
+                s1_study,
+                target=lambda t, p=pid: -t.user_attrs.get(p, 0.0),
+            )
+
     # ── Stage 2: per-pair re-fit for pairs below similarity threshold ────────
     s2_results  = {}
     fixed_params = {k: s1_best[k] for k in SHARED_KEYS} if SHARED_KEYS else {}
@@ -538,8 +581,12 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
     param_cols = list(PARAM_SPACE.keys())
     rows = []
 
+    def _imp_cols(imp_dict):
+        return {f"imp_{k}": imp_dict.get(k, float("nan")) for k in PARAM_SPACE}
+
     for pair_id, _ in dspTrial_pairs:
         base = {"subjID": subj_id, "env": env_prefix, "pair": pair_id}
+        s1_pair_imp_dict = s1_pair_imp.get(pair_id, nan_imp)
 
         # "group": Stage 1 best-trial params applied to this pair
         if s1_best:
@@ -554,6 +601,7 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                 "deviation":     0.0,
                 "sim_route":     group_route,
                 **s1_best,
+                **_imp_cols(s1_group_imp),
             })
 
         # "S1_pair": per-pair best cherry-picked from Stage 1 trials
@@ -567,6 +615,7 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                 "deviation":     _dev(cp["params"]),
                 "sim_route":     cp["route"],
                 **cp["params"],
+                **_imp_cols(s1_pair_imp_dict),
             })
 
         # "S2_pair": final outcome — Stage 2 best if it improved, S1_pair otherwise.
@@ -584,6 +633,17 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                 ],
                 key=lambda t_rs: t_rs[0].user_attrs.get(pair_id, 0.0),
                 reverse=True,
+            )
+            # Merge restarts into a single study for importance computation only;
+            # winner selection above is unchanged.
+            merged_s2 = optuna.create_study(direction="maximize")
+            for study, _rs in s2_results[pair_id]:
+                merged_s2.add_trials(
+                    [t for t in study.trials if t.state.name == "COMPLETE"]
+                )
+            s2_imp = _param_importance(
+                merged_s2,
+                target=lambda t, p=pair_id: -t.user_attrs.get(p, 0.0),
             )
             s2_row = None
             seen = set()
@@ -603,6 +663,7 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                         "deviation":     _dev(full_params),
                         "sim_route":     route,
                         **full_params,
+                        **_imp_cols(s2_imp),
                     }
                 break  # rank-1 only
             if s2_row is None and cp:
@@ -614,6 +675,7 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                     "deviation":     _dev(cp["params"]),
                     "sim_route":     cp["route"],
                     **cp["params"],
+                    **_imp_cols(s1_pair_imp_dict),
                 }
             if s2_row:
                 rows.append(s2_row)
@@ -626,11 +688,13 @@ def fit_participant(subj_id, env_prefix, n_trials=300, patience=30, processes=No
                 "deviation":     _dev(cp["params"]),
                 "sim_route":     cp["route"],
                 **cp["params"],
+                **_imp_cols(s1_pair_imp_dict),
             })
 
     df = pd.DataFrame(rows)
+    interleaved = [c for p in param_cols for c in (p, f"imp_{p}")]
     col_order = ["subjID", "env", "pair", "stage", "similarity", "similarity_sd",
-                 "deviation", "sim_route"] + param_cols
+                 "deviation", "sim_route"] + interleaved
     df = df[[c for c in col_order if c in df.columns]]
     df["stage"] = pd.Categorical(
         df["stage"], categories=["group", "S1_pair", "S2_pair"], ordered=True
